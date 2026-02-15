@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: yt-transcript
-Version: 0.1.0
-Summary: Fetch YouTube transcripts and clean them up with Claude
-Requires-Python: >=3.10
-Requires-Dist: youtube-transcript-api>=1.0.0
-Requires-Dist: yt-dlp>=2024.0
-Requires-Dist: anthropic>=0.40.0

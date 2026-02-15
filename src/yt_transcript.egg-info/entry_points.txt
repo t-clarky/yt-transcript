@@ -1,2 +1,0 @@
-[console_scripts]
-yt-transcript = yt_transcript.cli:main

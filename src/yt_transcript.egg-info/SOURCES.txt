@@ -1,9 +1,0 @@
-pyproject.toml
-src/yt_transcript/__init__.py
-src/yt_transcript/cli.py
-src/yt_transcript.egg-info/PKG-INFO
-src/yt_transcript.egg-info/SOURCES.txt
-src/yt_transcript.egg-info/dependency_links.txt
-src/yt_transcript.egg-info/entry_points.txt
-src/yt_transcript.egg-info/requires.txt
-src/yt_transcript.egg-info/top_level.txt
