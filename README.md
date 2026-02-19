@@ -43,6 +43,7 @@ yt-transcript dQw4w9WgXcQ
 | `--explain` | Generate a plain-English breakdown of the content |
 | `--summary` | Generate a bulleted list of key points |
 | `--tldr` | Generate a one-paragraph summary |
+| `--from-raw FILE` | Re-run cleanup from a saved `.raw.md` file (skips YouTube fetch) |
 
 Flags can be combined:
 
@@ -50,10 +51,20 @@ Flags can be combined:
 yt-transcript --explain --summary --tldr "https://youtube.com/watch?v=..."
 ```
 
+## Re-running from a saved raw file
+
+Every run saves the raw transcript to a `.raw.md` file. If cleanup fails or you want to re-process it later, use:
+
+```
+yt-transcript --from-raw ~/transcripts/video-title.raw.md
+yt-transcript --from-raw ~/transcripts/video-title.raw.md --explain --summary
+```
+
 ## Output
 
 All files are saved to `~/transcripts/`:
 
+- `video-title.raw.md` — unprocessed captions (always saved)
 - `video-title.md` — cleaned transcript
 - `video-title-explained.md` — layman explanation
 - `video-title-summary.md` — bullet-point summary
@@ -61,12 +72,33 @@ All files are saved to `~/transcripts/`:
 
 The transcript is also printed to the terminal.
 
+## How it handles long videos
+
+Long transcripts are automatically split into ~3000-word chunks, each cleaned separately using Claude Haiku (cheaper and fast). You'll see progress like:
+
+```
+Cleaning chunk 1/8...
+Cleaning chunk 2/8...
+```
+
+If cleanup fails partway through, whatever was cleaned so far is saved and you're shown a command to resume.
+
 ## Cost
 
-Uses Claude Sonnet 4.5. Typical costs per video:
+Cleanup uses Claude Haiku 4.5. The explain/summary/tldr flags use Claude Sonnet 4.5.
 
-- 5 min video — ~$0.01
-- 20 min video — ~$0.03–0.05
-- 1 hour video — ~$0.08–0.15
+After each run, token usage and estimated cost are printed:
 
-Each additional flag (explain, summary, tldr) adds a similar amount.
+```
+Tokens used: 12,450 in / 11,200 out
+Estimated cost: $0.0145
+```
+
+Typical cleanup costs:
+
+- 5 min video — less than $0.01
+- 20 min video — ~$0.01–0.02
+- 1 hour video — ~$0.03–0.05
+- 2 hour video — ~$0.05–0.10
+
+Each additional flag (explain, summary, tldr) adds a few cents.

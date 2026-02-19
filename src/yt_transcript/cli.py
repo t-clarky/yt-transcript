@@ -11,6 +11,50 @@ import anthropic
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 
+CLEANUP_MODEL = "claude-haiku-4-5-20251001"
+SMART_MODEL = "claude-sonnet-4-5-20250929"
+CHUNK_SIZE_WORDS = 3000
+
+# Pricing per million tokens
+HAIKU_INPUT_COST = 0.80
+HAIKU_OUTPUT_COST = 4.00
+SONNET_INPUT_COST = 3.00
+SONNET_OUTPUT_COST = 15.00
+
+
+class TokenTracker:
+    def __init__(self):
+        self.haiku_input = 0
+        self.haiku_output = 0
+        self.sonnet_input = 0
+        self.sonnet_output = 0
+
+    def add(self, usage, model):
+        if model == CLEANUP_MODEL:
+            self.haiku_input += usage.input_tokens
+            self.haiku_output += usage.output_tokens
+        else:
+            self.sonnet_input += usage.input_tokens
+            self.sonnet_output += usage.output_tokens
+
+    def total_cost(self):
+        cost = 0
+        cost += (self.haiku_input / 1_000_000) * HAIKU_INPUT_COST
+        cost += (self.haiku_output / 1_000_000) * HAIKU_OUTPUT_COST
+        cost += (self.sonnet_input / 1_000_000) * SONNET_INPUT_COST
+        cost += (self.sonnet_output / 1_000_000) * SONNET_OUTPUT_COST
+        return cost
+
+    def report(self):
+        total_in = self.haiku_input + self.sonnet_input
+        total_out = self.haiku_output + self.sonnet_output
+        cost = self.total_cost()
+        print(f"\nTokens used: {total_in:,} in / {total_out:,} out")
+        print(f"Estimated cost: ${cost:.4f}")
+
+
+tracker = TokenTracker()
+
 
 def extract_video_id(url_or_id: str) -> str:
     """Extract a YouTube video ID from a URL or return it if already an ID."""
@@ -22,7 +66,6 @@ def extract_video_id(url_or_id: str) -> str:
         if match:
             return match.group(1)
 
-    # Check if it's already a bare video ID
     if re.fullmatch(r"[a-zA-Z0-9_-]{11}", url_or_id):
         return url_or_id
 
@@ -50,27 +93,72 @@ def fetch_transcript(video_id: str) -> str:
     return " ".join(parts)
 
 
-def call_claude(prompt: str) -> str:
+def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE_WORDS) -> list[str]:
+    """Split text into chunks of approximately chunk_size words."""
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(words[i : i + chunk_size])
+        chunks.append(chunk)
+    return chunks
+
+
+def call_claude(prompt: str, model: str = SMART_MODEL) -> str:
     """Send a prompt to Claude and return the response text."""
     client = anthropic.Anthropic()
     message = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
+        model=model,
         max_tokens=16000,
         messages=[{"role": "user", "content": prompt}],
     )
+    tracker.add(message.usage, model)
     return message.content[0].text
 
 
-def clean_transcript(raw_text: str) -> str:
-    """Send the raw transcript to Claude for cleanup."""
-    return call_claude(
-        "Below is a raw YouTube transcript. Clean it up by adding proper "
-        "punctuation, capitalization, and paragraph breaks. Fix obvious "
-        "transcription errors where the intended word is clear. Keep the "
-        "content exactly as spoken — do not summarize, rephrase, or omit "
-        "anything. Do not add any commentary, headers, or notes. Return "
-        f"only the cleaned transcript text.\n\n{raw_text}"
-    )
+def clean_transcript(raw_text: str, start_chunk: int = 0) -> str:
+    """Clean the transcript in chunks using Haiku."""
+    chunks = split_into_chunks(raw_text)
+    total = len(chunks)
+    cleaned_parts = []
+
+    if total == 1:
+        print("Cleaning transcript with Claude...")
+        cleaned = call_claude(
+            "Below is a raw YouTube transcript. Clean it up by adding proper "
+            "punctuation, capitalization, and paragraph breaks. Fix obvious "
+            "transcription errors where the intended word is clear. Keep the "
+            "content exactly as spoken — do not summarize, rephrase, or omit "
+            "anything. Do not add any commentary, headers, or notes. Return "
+            f"only the cleaned transcript text.\n\n{chunks[0]}",
+            model=CLEANUP_MODEL,
+        )
+        return cleaned, total, total
+
+    for i, chunk in enumerate(chunks):
+        if i < start_chunk:
+            cleaned_parts.append(chunk)
+            continue
+        print(f"Cleaning chunk {i + 1}/{total}...")
+        try:
+            cleaned = call_claude(
+                "Clean up this transcript segment — add punctuation, paragraphs, "
+                "and fix obvious transcription errors. Keep the content exactly as "
+                "spoken. This is part of a longer transcript so don't add any "
+                f"introduction or conclusion.\n\n{chunk}",
+                model=CLEANUP_MODEL,
+            )
+            cleaned_parts.append(cleaned)
+        except anthropic.APIError as e:
+            print(
+                f"\nError on chunk {i + 1}/{total}: {e}",
+                file=sys.stderr,
+            )
+            if cleaned_parts:
+                partial = "\n\n".join(cleaned_parts)
+                return partial, i, total
+            raise
+
+    return "\n\n".join(cleaned_parts), total, total
 
 
 def explain_transcript(transcript: str) -> str:
@@ -139,6 +227,7 @@ def main():
     )
     parser.add_argument(
         "url",
+        nargs="?",
         help="YouTube URL or video ID",
     )
     parser.add_argument(
@@ -161,71 +250,109 @@ def main():
         action="store_true",
         help="Add a one-paragraph TLDR",
     )
+    parser.add_argument(
+        "--from-raw",
+        metavar="FILE",
+        help="Re-run cleanup on an existing .raw.md file instead of fetching from YouTube",
+    )
     args = parser.parse_args()
+
+    if not args.url and not args.from_raw:
+        parser.error("Provide a YouTube URL/ID or use --from-raw FILE")
+
+    # --from-raw mode: load raw text from file, derive base_name from filename
+    if args.from_raw:
+        raw_path = Path(args.from_raw)
+        if not raw_path.exists():
+            print(f"Error: File not found: {raw_path}", file=sys.stderr)
+            sys.exit(1)
+        raw_text = raw_path.read_text(encoding="utf-8")
+        # Derive base_name: strip .raw.md from filename
+        fname = raw_path.name
+        if fname.endswith(".raw.md"):
+            base_name = fname[: -len(".raw.md")]
+        else:
+            base_name = raw_path.stem
+        title = base_name
+        output_dir = raw_path.parent
+        print(f"Loaded raw transcript from {raw_path} ({len(raw_text.split()):,} words)\n")
+    else:
+        # Normal mode: fetch from YouTube
+        video_id = extract_video_id(args.url)
+        if not video_id:
+            print(f"Error: Could not parse a video ID from '{args.url}'", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            title = get_video_title(video_id)
+        except Exception as e:
+            print(f"Error fetching video title: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Video: {title}\n")
+
+        try:
+            raw_text = fetch_transcript(video_id)
+        except Exception as e:
+            error_msg = str(e)
+            if "No transcripts" in error_msg or "TranscriptsDisabled" in error_msg:
+                print("Error: No captions/transcripts are available for this video.", file=sys.stderr)
+            elif "VideoUnavailable" in error_msg:
+                print("Error: This video is unavailable.", file=sys.stderr)
+            else:
+                print(f"Error fetching transcript: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        output_dir = Path.home() / "transcripts"
+        base_name = sanitize_filename(title)
+
+    output_dir.mkdir(exist_ok=True)
+
+    # Always save raw transcript
+    raw_path = output_dir / f"{base_name}.raw.md"
+    raw_path.write_text(raw_text, encoding="utf-8")
+    print(f"Raw transcript saved to {raw_path}")
 
     needs_claude = not args.raw or args.explain or args.summary or args.tldr
     if needs_claude:
         check_api_key()
 
-    # Extract video ID
-    video_id = extract_video_id(args.url)
-    if not video_id:
-        print(f"Error: Could not parse a video ID from '{args.url}'", file=sys.stderr)
-        sys.exit(1)
-
-    # Fetch video title
     try:
-        title = get_video_title(video_id)
-    except Exception as e:
-        print(f"Error fetching video title: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Video: {title}\n")
-
-    # Fetch transcript
-    try:
-        raw_text = fetch_transcript(video_id)
-    except Exception as e:
-        error_msg = str(e)
-        if "No transcripts" in error_msg or "TranscriptsDisabled" in error_msg:
-            print("Error: No captions/transcripts are available for this video.", file=sys.stderr)
-        elif "VideoUnavailable" in error_msg:
-            print("Error: This video is unavailable.", file=sys.stderr)
-        else:
-            print(f"Error fetching transcript: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Set up output directory
-    output_dir = Path.home() / "transcripts"
-    output_dir.mkdir(exist_ok=True)
-    base_name = sanitize_filename(title)
-
-    try:
-        # Clean or raw transcript
         if args.raw:
             transcript = raw_text
         else:
-            print("Cleaning transcript with Claude...")
-            transcript = clean_transcript(raw_text)
+            word_count = len(raw_text.split())
+            chunk_count = max(1, (word_count + CHUNK_SIZE_WORDS - 1) // CHUNK_SIZE_WORDS)
+            print(f"Transcript: {word_count:,} words ({chunk_count} chunk{'s' if chunk_count > 1 else ''})\n")
+
+            transcript, completed, total = clean_transcript(raw_text)
+
+            if completed < total:
+                print(
+                    f"\nPartial cleanup: {completed}/{total} chunks completed.",
+                    file=sys.stderr,
+                )
+                print(
+                    f"To resume, fix the issue and run:\n"
+                    f"  yt-transcript --from-raw \"{raw_path}\"",
+                    file=sys.stderr,
+                )
 
         transcript_path = output_dir / f"{base_name}.md"
         save_and_print(transcript, transcript_path, "Transcript")
 
-        # Explain
         if args.explain:
             print("Generating plain-English explanation...")
             explanation = explain_transcript(transcript)
             explain_path = output_dir / f"{base_name}-explained.md"
             save_and_print(explanation, explain_path, "Explanation")
 
-        # Summary
         if args.summary:
             print("Generating summary...")
             summary = summarize_transcript(transcript)
             summary_path = output_dir / f"{base_name}-summary.md"
             save_and_print(summary, summary_path, "Summary")
 
-        # TLDR
         if args.tldr:
             print("Generating TLDR...")
             tldr = tldr_transcript(transcript)
@@ -234,7 +361,10 @@ def main():
 
     except anthropic.APIError as e:
         print(f"Error calling Anthropic API: {e}", file=sys.stderr)
+        print(f"Raw transcript is saved at: {raw_path}", file=sys.stderr)
         sys.exit(1)
+
+    tracker.report()
 
 
 if __name__ == "__main__":
